@@ -298,7 +298,13 @@ def crawl():
             print(f"[WARN] fetch failed {url}: {e}")
             continue
 
-        if resp.status_code != 200 or "text/html" not in (resp.headers.get("Content-Type","")):
+        # Было строго: if resp.status_code != 200 or "text/html" not in (resp.headers.get("Content-Type","")): continue
+        ctype = resp.headers.get("Content-Type", "")
+        if resp.status_code != 200:
+            print(f"[SKIP] {url} -> HTTP {resp.status_code} ({ctype})")
+            continue
+        if "text" not in ctype and "html" not in ctype:
+            print(f"[SKIP] {url} -> non-text content ({ctype})")
             continue
 
         soup = BeautifulSoup(resp.text, "lxml")
@@ -310,7 +316,11 @@ def crawl():
         text = normalize_space(text)
 
         # Подготовим файл
-        slug = slugify(url)
+        # Гарантированно сохраним главную страницу
+        if url == START_URL:
+            slug = "index"
+        else:
+            slug = slugify(url)
         txt_path = os.path.join(DOCS_DIR, f"{slug}.txt")
 
         # Мета-заголовок + очищенный текст
