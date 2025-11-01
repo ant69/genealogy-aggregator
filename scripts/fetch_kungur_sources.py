@@ -315,15 +315,18 @@ def crawl():
 
         # Мета-заголовок + очищенный текст
         content_hash = sha256_text(text)
+       
+        title_escaped = title.replace('"', '\\"')
+       
         header = [
-            "---",
-            f"source_url: {url}",
-            f"title: \"{title.replace('\"', '\\\"')}\"",
-            f"collected_at: \"{now_iso()}\"",
-            f"content_hash: \"sha256:{content_hash}\"",
-            "lang: ru",
-            "---",
-            "",
+             "---",
+             f"source_url: {url}",
+             f'title: "{title_escaped}"',
+             f'collected_at: "{now_iso()}"',
+             f'content_hash: "sha256:{content_hash}"',
+             "lang: ru",
+             "---",
+             "",
         ]
         out_text = "\n".join(header) + text + "\n"
 
