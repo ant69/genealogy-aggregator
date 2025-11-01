@@ -1,0 +1,38 @@
+name: Fetch kungur-sources & Build Tables
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "23 3 * * 2,5"   # Вт и Пт в 03:23 UTC
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run crawler & parser
+        run: |
+          python scripts/fetch_kungur_sources.py
+
+      - name: Auto-commit data changes
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "chore(data): update kungur-sources docs/tables/index"
+          file_pattern: |
+            data/kungur-sources/index.jsonl
+            data/kungur-sources/docs/*.txt
+            data/kungur-sources/tables/*.csv
