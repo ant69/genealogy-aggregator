@@ -28,11 +28,10 @@ jobs:
         run: |
           python scripts/fetch_kungur_sources.py
 
-      - name: Auto-commit data changes
-        uses: stefanzweifel/git-auto-commit-action@v5
-        with:
-          commit_message: "chore(data): update kungur-sources docs/tables/index"
-          file_pattern: |
-            data/kungur-sources/index.jsonl
-            data/kungur-sources/docs/*.txt
-            data/kungur-sources/tables/*.csv
+      - name: Commit data (robust)
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A data/kungur-sources
+          git commit -m "chore(data): update kungur-sources docs/tables/index" || echo "No changes to commit"
+          git push
