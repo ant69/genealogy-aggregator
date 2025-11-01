@@ -2,23 +2,23 @@
 # -*- coding: utf-8 -*-
 
 """
-Kungur Sources Crawler & Text Extractor & People Parser (prototype)
+Kungur Sources Crawler & Text Extractor & People Parser (hybrid, safe-by-default)
 
 Что делает за один прогон:
-1) Обходит https://kungur-sources.github.io/ (внутренние ссылки, глубина по умолчанию 2)
+1) Обходит https://kungur-sources.github.io/ в пределах домена (глубина по умолчанию 2, предохранитель по кол-ву страниц).
 2) Для каждой HTML-страницы:
-   - скачивает и извлекает основной текст (чистит меню/навигацию)
-   - сохраняет текст в data/kungur-sources/docs/<slug>.txt
-   - пишет запись в data/kungur-sources/index.jsonl (source_url, title, path, hash, collected_at)
-3) Бегло парсит персоналии (имя/возраст/роль) и сохраняет CSV в data/kungur-sources/tables/<slug>.csv
-   - создаёт сводный data/kungur-sources/tables/_all_people.csv
+   - извлекает и очищает основной текст (без навигации), всегда сохраняет в data/kungur-sources/docs/<slug>.txt
+   - пишет/обновляет запись в data/kungur-sources/index.jsonl (source_url, title, path, hash, collected_at)
+3) Пытается извлечь персоналии (имя/возраст/роль) по эвристикам:
+   - если получилось — сохраняет CSV в data/kungur-sources/tables/<slug>.csv
+   - формирует сводный data/kungur-sources/tables/_all_people.csv
+
+Гибкая стратегия:
+- Текст и индекс сохраняем всегда (это база для полнотекстового поиска).
+- Таблицы — best effort: если формат «нестандартный», просто нет CSV для этой страницы.
 
 Запуск локально:
   python scripts/fetch_kungur_sources.py
-
-Примечания:
-- Эвристики извлечения текста и персоналий упрощены. Подгоняются под реальный контент.
-- Соблюдает вежливый rate limit (1 запрос/сек).
 """
 
 import os
@@ -35,13 +35,16 @@ from urllib.parse import urljoin, urlparse, urldefrag
 import requests
 from bs4 import BeautifulSoup
 
-# ---------- Конфиг ----------
+# ------------------ Конфиг ------------------
 START_URL = "https://kungur-sources.github.io/"
 DOMAIN = "kungur-sources.github.io"
-MAX_PAGES = 2000        # предохранитель
-MAX_DEPTH = 2           # глубина обхода
+MAX_PAGES = 2000           # предохранитель
+MAX_DEPTH = 2              # глубина обхода
 REQUEST_TIMEOUT = 30
 RATE_LIMIT_SECONDS = 1
+
+# Табличный парсинг можно ослабить/усилить:
+STRICT_PARSE = False       # False = мягкий режим: никогда не падаем из-за непарсибельного текста
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = os.path.join(REPO_ROOT, "data", "kungur-sources")
@@ -57,10 +60,13 @@ HEADERS = {
 os.makedirs(DOCS_DIR, exist_ok=True)
 os.makedirs(TABLES_DIR, exist_ok=True)
 os.makedirs(DATA_DIR, exist_ok=True)
+if not os.path.exists(INDEX_PATH):
+    with open(INDEX_PATH, "w", encoding="utf-8") as _f:
+        _f.write("")
 
-# ---------- Вспомогательные ----------
+# ------------------ Утилиты ------------------
 
-def now_iso():
+def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 def normalize_space(s: str) -> str:
@@ -71,16 +77,14 @@ def normalize_space(s: str) -> str:
 
 def slugify(path: str) -> str:
     """
-    Делает компактное имя файла из пути URL.
+    Делает компактное имя файла из URL-пути. Кириллицу латинизируем.
     """
-    # только часть пути, без домена и query
     parsed = urlparse(path)
-    p = parsed.path
+    p = parsed.path or ""
     if p.endswith("/"):
         p = p[:-1]
     if not p:
         p = "index"
-    # Заменяем недопустимые символы
     p = unicodedata.normalize("NFKD", p)
     p = p.encode("ascii", "ignore").decode("ascii")
     p = p.strip("/")
@@ -97,44 +101,22 @@ def is_internal_link(href: str) -> bool:
     if not href:
         return False
     href = href.strip()
-    if href.startswith("mailto:") or href.startswith("javascript:"):
+    if href.startswith(("mailto:", "javascript:")):
         return False
     if href.startswith("#"):
         return True
     parsed = urlparse(href)
     if parsed.netloc and parsed.netloc != DOMAIN:
         return False
-    # отсекаем очевидные ассеты
     if parsed.path.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".svg", ".css", ".js", ".pdf", ".zip")):
         return False
     return True
 
-def choose_main_node(soup: BeautifulSoup):
-    """
-    Эвристика выбора основной колонки текста:
-    1) <main> или <article>
-    2) самый длинный <div> по числу букв (последний шанс)
-    """
-    for tag in ("main", "article"):
-        node = soup.find(tag)
-        if node and len(node.get_text(strip=True)) > 200:
-            return node
-
-    # выкидываем навигацию/футеры/сайдбары
-    for selector in ["nav", "header", "footer", "aside"]:
-        for el in soup.find_all(selector):
-            el.decompose()
-
-    # ищем самый «текстовый» div
-    best = None
-    best_len = 0
-    for div in soup.find_all("div"):
-        txt = div.get_text(" ", strip=True)
-        l = len(txt)
-        if l > best_len:
-            best_len = l
-            best = div
-    return best or soup.body or soup
+def fetch(url: str) -> requests.Response:
+    resp = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+    if not resp.encoding or resp.encoding.lower() in ("ascii", "utf-8"):
+        resp.encoding = resp.apparent_encoding or "utf-8"
+    return resp
 
 def extract_title(soup: BeautifulSoup) -> str:
     if soup.title and soup.title.string:
@@ -144,20 +126,33 @@ def extract_title(soup: BeautifulSoup) -> str:
         return h1.get_text(" ", strip=True)
     return ""
 
-def fetch(url: str) -> requests.Response:
-    resp = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
-    # Коррекция кодировки, если не задана
-    if not resp.encoding or resp.encoding.lower() in ("ascii", "utf-8"):
-        resp.encoding = resp.apparent_encoding or "utf-8"
-    return resp
+def choose_main_node(soup: BeautifulSoup):
+    """
+    Эвристика основной колонки:
+    1) <main> или <article>
+    2) иначе — самый длинный <div> по числу букв (последний шанс)
+    """
+    for tag in ("main", "article"):
+        node = soup.find(tag)
+        if node and len(node.get_text(strip=True)) > 200:
+            return node
 
-# ---------- Индекс ----------
+    for selector in ("nav", "header", "footer", "aside"):
+        for el in soup.find_all(selector):
+            el.decompose()
+
+    best, best_len = None, 0
+    for div in soup.find_all("div"):
+        txt = div.get_text(" ", strip=True)
+        if len(txt) > best_len:
+            best_len = len(txt)
+            best = div
+    return best or soup.body or soup
+
+# ------------------ Индекс ------------------
 
 def load_index() -> dict:
-    """
-    Читаем index.jsonl -> dict[url] = last_record
-    """
-    index = {}
+    idx = {}
     if os.path.exists(INDEX_PATH):
         with open(INDEX_PATH, "r", encoding="utf-8") as f:
             for line in f:
@@ -166,16 +161,16 @@ def load_index() -> dict:
                     continue
                 try:
                     rec = json.loads(line)
-                    index[rec["source_url"]] = rec
+                    idx[rec["source_url"]] = rec
                 except Exception:
                     continue
-    return index
+    return idx
 
 def append_index(rec: dict):
     with open(INDEX_PATH, "a", encoding="utf-8") as f:
         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
-# ---------- Парсер персоналий (черновой) ----------
+# ------------------ Черновой парсинг персоналий ------------------
 
 ROLE_MARKERS = [
     ("дети", "child"),
@@ -193,7 +188,6 @@ ROLE_MARKERS = [
     ("подворник", "lodger"),
     ("приемыш", "foster"),
 ]
-
 HEAD_RE = re.compile(r'^([А-ЯЁA-Z][\w\-]+)\s+([А-ЯЁA-Z][\w\-]+)\s+сын\s+([А-ЯЁA-Z][\w\-]+)\s+(\d{1,3})', re.IGNORECASE)
 NAME_AGE_RE = re.compile(r'([А-ЯЁA-Z][\w\-]+)\s+(\d{1,3})(?:\b|$)', re.IGNORECASE)
 SETTLEMENT_RE = re.compile(r'^(?:села|село|деревни|деревня|острожку|острог|г\.)\s+.*$', re.IGNORECASE)
@@ -207,7 +201,8 @@ def detect_role(segment: str):
 
 def parse_people_from_text(doc_text: str):
     """
-    Возвращает список словарей: line_no, settlement, folio, role, name, patronymic, family, age, raw_segment.
+    Возвращает список словарей:
+    line_no, settlement, folio, role, name, patronymic, family, age, raw_segment.
     """
     rows = []
     lines = [l.strip() for l in doc_text.split("\n")]
@@ -224,7 +219,6 @@ def parse_people_from_text(doc_text: str):
         if SETTLEMENT_RE.match(raw_line):
             current_settlement = raw_line
 
-        # дробим по ;
         segments = [s.strip() for s in raw_line.split(";") if s.strip()]
         if not segments:
             continue
@@ -246,6 +240,7 @@ def parse_people_from_text(doc_text: str):
             })
             segments[0] = segments[0][head_parsed.end():].strip()
 
+        # Остальные сегменты как родственники/прочие
         for seg in segments:
             role, _ru = detect_role(seg)
             for m in NAME_AGE_RE.finditer(seg):
@@ -263,10 +258,9 @@ def parse_people_from_text(doc_text: str):
                     "age": age,
                     "raw_segment": seg,
                 })
-
     return rows
 
-# ---------- Основной обход ----------
+# ------------------ Обход ------------------
 
 @dataclass
 class QueueItem:
@@ -277,20 +271,20 @@ def crawl():
     seen = set()
     q = [QueueItem(START_URL, 0)]
     index = load_index()
+
     saved_pages = 0
     parsed_pages = 0
-
     all_people_rows = []
 
-    while q and saved_pages < MAX_PAGES:
+    while q and saved_pages + parsed_pages < MAX_PAGES:
         item = q.pop(0)
         url, depth = item.url, item.depth
-        url = urldefrag(url)[0]  # без #fragment
-
+        url = urldefrag(url)[0]
         if url in seen:
             continue
         seen.add(url)
 
+        # Загрузка
         try:
             time.sleep(RATE_LIMIT_SECONDS)
             resp = fetch(url)
@@ -298,7 +292,6 @@ def crawl():
             print(f"[WARN] fetch failed {url}: {e}")
             continue
 
-        # Было строго: if resp.status_code != 200 or "text/html" not in (resp.headers.get("Content-Type","")): continue
         ctype = resp.headers.get("Content-Type", "")
         if resp.status_code != 200:
             print(f"[SKIP] {url} -> HTTP {resp.status_code} ({ctype})")
@@ -308,48 +301,42 @@ def crawl():
             continue
 
         soup = BeautifulSoup(resp.text, "lxml")
-        title = extract_title(soup)
+        title = extract_title(soup) or ""
 
-        # Извлекаем основной текст
         main = choose_main_node(soup)
         text = main.get_text("\n", strip=True) if main else soup.get_text("\n", strip=True)
         text = normalize_space(text)
 
-        # Подготовим файл
-        # Гарантированно сохраним главную страницу
-        if url == START_URL:
-            slug = "index"
-        else:
-            slug = slugify(url)
+        # slug: индекс для главной, иначе из пути
+        slug = "index" if url == START_URL else slugify(url)
         txt_path = os.path.join(DOCS_DIR, f"{slug}.txt")
 
-        # Мета-заголовок + очищенный текст
+        # YAML-шапка + текст
         content_hash = sha256_text(text)
-       
         title_escaped = title.replace('"', '\\"')
-       
         header = [
-             "---",
-             f"source_url: {url}",
-             f'title: "{title_escaped}"',
-             f'collected_at: "{now_iso()}"',
-             f'content_hash: "sha256:{content_hash}"',
-             "lang: ru",
-             "---",
-             "",
+            "---",
+            f"source_url: {url}",
+            f'title: "{title_escaped}"',
+            f'collected_at: "{now_iso()}"',
+            f'content_hash: "sha256:{content_hash}"',
+            "lang: ru",
+            "---",
+            "",
         ]
         out_text = "\n".join(header) + text + "\n"
 
-        # Проверим, есть ли в индексе и не поменялся ли хэш
+        # Индекс/решение о записи
         prev = index.get(url)
-        need_write = True
-        if prev and prev.get("content_hash") == content_hash:
-            need_write = False
+        file_missing = not os.path.exists(txt_path)
+        content_changed = not prev or prev.get("content_hash") != content_hash
+        need_write = file_missing or content_changed
 
+        # Всегда сохраняем текст и индекс при необходимости
         if need_write:
             with open(txt_path, "w", encoding="utf-8") as f:
                 f.write(out_text)
-            saved_pages += 1
+
             rec = {
                 "source_url": url,
                 "title": title,
@@ -359,10 +346,20 @@ def crawl():
             }
             append_index(rec)
             index[url] = rec
+            saved_pages += 1
             print(f"[OK] saved: {url} -> {rec['path']}")
+        else:
+            print(f"[SKIP] up-to-date: {url} -> {os.path.relpath(txt_path, REPO_ROOT)}")
 
-        # Построим таблицу персоналий по этой странице
-        people = parse_people_from_text(text)
+        # Попытка извлечь персоналии
+        try:
+            people = parse_people_from_text(text)
+        except Exception as e:
+            if STRICT_PARSE:
+                raise
+            print(f"[WARN] parse skipped (non-fatal) {url}: {e}")
+            people = []
+
         if people:
             csv_path = os.path.join(TABLES_DIR, f"{slug}.csv")
             with open(csv_path, "w", newline="", encoding="utf-8") as f:
@@ -378,9 +375,9 @@ def crawl():
                   r["role"], r["name"], r["patronymic"], r["family"], r["age"], r["raw_segment"]]
                  for r in people]
             )
-            print(f"[OK] people parsed: {url} -> tables/{slug}.csv ({len(people)} rows)")
+            print(f"[OK] people parsed: {url} -> tables/{os.path.basename(csv_path)} ({len(people)} rows)")
 
-        # Соберём новые ссылки
+        # Сбор ссылок
         if depth < MAX_DEPTH:
             for a in soup.find_all("a", href=True):
                 href = a["href"]
@@ -405,5 +402,6 @@ def crawl():
 
     print(f"Done. Saved pages: {saved_pages}, Parsed pages: {parsed_pages}")
 
+# ------------------ entry ------------------
 if __name__ == "__main__":
     crawl()
